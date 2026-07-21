@@ -5,6 +5,7 @@ mod adr_export;
 mod cache;
 mod db;
 mod decay;
+mod embed_remote;
 mod embedding;
 mod error;
 mod export;
@@ -192,6 +193,18 @@ enum Commands {
         #[arg(short, long, default_value = "0.90")]
         threshold: f32,
         /// Actually merge (default: dry run)
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Re-embed all memories in the current project through the currently configured
+    /// embedding backend, overwriting stored vectors in place.
+    ///
+    /// Use this after switching `ENGRAM_EMBED_BACKEND` (or any other change that alters
+    /// what `model_version` the embedding service reports) so the whole project's
+    /// embeddings stay in one comparable vector space. Also migrates handoff sidecar
+    /// per-section embeddings for any handoff memories that are re-embedded.
+    Reembed {
+        /// Actually re-embed and overwrite (default: dry run)
         #[arg(long)]
         confirm: bool,
     },
@@ -523,6 +536,7 @@ fn needs_embedding_service(cmd: &Commands) -> bool {
         | Commands::Update { .. }
         | Commands::Import { .. }
         | Commands::Dedup { .. }
+        | Commands::Reembed { .. }
         | Commands::Context { .. } => true,
         Commands::Handoff { cmd: handoff_cmd } => matches!(
             handoff_cmd,
@@ -555,6 +569,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+
+    // Refuse to run against a project whose stored embeddings are on a different
+    // model_version than this backend produces -- except `reembed` itself, whose whole
+    // purpose is to fix exactly that mismatch.
+    if let Some(es) = &embedding_service
+        && !matches!(cli.command, Commands::Reembed { .. })
+    {
+        embedding::check_model_version_guard(&db, es, &project_id)?;
+    }
 
     // Detect current branch once for commands that need it
     let current_branch = get_current_branch();
@@ -698,6 +721,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &project_id,
                 embedding_service.as_ref().unwrap(),
                 threshold,
+                confirm,
+            )?;
+        }
+        Commands::Reembed { confirm } => {
+            cmd_reembed(
+                &db,
+                &project_id,
+                embedding_service.as_ref().unwrap(),
                 confirm,
             )?;
         }
@@ -1671,6 +1702,99 @@ fn cmd_promote(db: &Database, id: &str) -> Result<(), MemoryError> {
     } else {
         println!("Failed to promote memory {}", id);
     }
+
+    Ok(())
+}
+
+/// Re-embed every memory in `project_id` currently stored under a `model_version` other
+/// than `embedding_service.model_version()`, overwriting the embedding in place.
+///
+/// General-purpose (not hardcoded to any one backend transition): whatever
+/// `EmbeddingService` is configured for this process is what memories get re-embedded
+/// through, so this works for migrating between any two backends/model_versions.
+///
+/// Handoff memories additionally carry per-section embeddings in the `handoff_sections`
+/// sidecar (not tracked by their own `model_version`, since they're always produced by
+/// whatever embedding service wrote the parent memory). Re-embedding only the main
+/// content and leaving those sidecar vectors on the old model would reintroduce the same
+/// mixed-vector-space problem this command exists to fix, so they're recomputed and
+/// overwritten too whenever their parent handoff memory is re-embedded.
+fn cmd_reembed(
+    db: &Database,
+    project_id: &str,
+    embedding_service: &EmbeddingService,
+    confirm: bool,
+) -> Result<(), MemoryError> {
+    let target_version = embedding_service.model_version().to_string();
+
+    let memories = db.get_all_memories_for_project(project_id)?;
+    let versions: std::collections::HashMap<String, Option<String>> = db
+        .get_memory_model_versions(project_id)?
+        .into_iter()
+        .collect();
+
+    let mut candidates: Vec<&Memory> = Vec::new();
+    let mut by_old_version: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for memory in &memories {
+        let current = versions.get(&memory.id).cloned().flatten();
+        if current.as_deref() != Some(target_version.as_str()) {
+            let label = current.unwrap_or_else(|| "(no embedding)".to_string());
+            *by_old_version.entry(label).or_insert(0) += 1;
+            candidates.push(memory);
+        }
+    }
+
+    if candidates.is_empty() {
+        println!(
+            "All {} memories in project '{}' are already at model_version '{}'. Nothing to do.",
+            memories.len(),
+            project_id,
+            target_version
+        );
+        return Ok(());
+    }
+
+    println!("Target model_version: '{}'", target_version);
+    for (old_version, count) in &by_old_version {
+        println!(
+            "  {} memories currently at model_version '{}' would be re-embedded to '{}'",
+            count, old_version, target_version
+        );
+    }
+
+    if !confirm {
+        println!("\nRun with --confirm to actually re-embed these memories.");
+        return Ok(());
+    }
+
+    let mut reembedded = 0usize;
+    let mut sections_updated = 0usize;
+    for memory in &candidates {
+        let vector = embedding_service.embed_memory(memory.memory_type, &memory.content)?;
+        db.store_embedding(&memory.id, &vector, &target_version)?;
+        reembedded += 1;
+
+        if memory.memory_type == MemoryType::Handoff
+            && let Some((sections, _old_section_vecs)) = db.get_handoff_sections(&memory.id)?
+        {
+            let section_texts = tools::handoff_section_key_texts(&sections);
+            let mut keys: Vec<&str> = Vec::new();
+            let mut vecs: Vec<Vec<f32>> = Vec::new();
+            for (key, text) in &section_texts {
+                vecs.push(embedding_service.embed(text)?);
+                keys.push(key);
+            }
+            let (keys_str, bytes) = db::encode_section_embeddings(&keys, &vecs);
+            db.update_handoff_sections(&memory.id, &sections, &keys_str, &bytes)?;
+            sections_updated += 1;
+        }
+    }
+
+    println!(
+        "Re-embedded {} memories to model_version '{}' ({} handoff sidecars updated).",
+        reembedded, target_version, sections_updated
+    );
 
     Ok(())
 }

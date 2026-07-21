@@ -17,7 +17,10 @@ mod test_utils;
 
 pub use adr::{AdrCreateResult, create_adr};
 pub use handler::{ToolHandler, parse_search_mode};
-pub use handoff::{create_handoff, resume_handoff, score_handoff_sections, search_handoffs};
+pub use handoff::{
+    create_handoff, handoff_section_key_texts, resume_handoff, score_handoff_sections,
+    search_handoffs,
+};
 pub use schemas::{
     MemoryUpdateInput, ToolProfile, dedup_threshold, get_tool_definitions, get_tool_definitions_for,
 };

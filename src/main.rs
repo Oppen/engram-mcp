@@ -4,6 +4,7 @@ mod adr_export;
 mod cache;
 mod db;
 mod decay;
+mod embed_remote;
 mod embedding;
 mod error;
 mod export;
@@ -504,6 +505,9 @@ impl MemoryServer {
                 .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
 
             let embedding = EmbeddingService::new()
+                .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
+
+            embedding::check_model_version_guard(&db, &embedding, &self.project_id)
                 .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
 
             let mode = parse_search_mode(std::env::var("ENGRAM_SEARCH_MODE").ok().as_deref());

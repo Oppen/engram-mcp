@@ -157,6 +157,49 @@ impl Database {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Distinct `model_version` values currently stored for a project's memories.
+    ///
+    /// Used by `check_model_version_guard` to detect a project whose embeddings are
+    /// split across backends/builds (e.g. mid-migration, or after switching
+    /// `ENGRAM_EMBED_BACKEND` without running `engram-cli reembed`).
+    pub fn get_model_versions_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<String>, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT e.model_version FROM embeddings e
+             JOIN memories m ON e.memory_id = m.id
+             WHERE m.project_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(MemoryError::from)
+    }
+
+    /// Per-memory `model_version` for a project, as `(memory_id, model_version)`.
+    ///
+    /// `model_version` is `None` for a memory with no embedding row at all (should
+    /// not normally happen, but is treated as "needs (re-)embedding" by
+    /// `engram-cli reembed` rather than panicking).
+    #[allow(dead_code)] // Used by engram-cli's `reembed` command, not the MCP server binary
+    pub fn get_memory_model_versions(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(String, Option<String>)>, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT m.id, e.model_version FROM memories m
+             LEFT JOIN embeddings e ON e.memory_id = m.id
+             WHERE m.project_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(MemoryError::from)
+    }
+
     /// Store multiple embeddings in a single transaction
     #[allow(dead_code)] // Used by MCP server tools
     pub fn store_embeddings_batch(
