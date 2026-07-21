@@ -15,7 +15,8 @@ src/
   lib.rs       - module exports
   db.rs        - SQLite ops (memories, embeddings, relationships, batch ops)
   memory.rs    - Memory, MemoryType, MergeSource, MemoryCluster, Relationship, RelationType, ProjectStats
-  embedding.rs - mdbr-leaf-ir ONNX wrapper (256-dim MRL vectors)
+  embedding.rs - mdbr-leaf-ir ONNX wrapper (256-dim MRL vectors); backend switch (in-process fastembed vs. onnxruntime-server HTTP) + model_version guard
+  embed_remote.rs - onnxruntime-server HTTP client: tokenizer loading, CLS-pool, HTTP request/response
   decay.rs     - relevance decay algorithm
   tools.rs     - MCP tool handlers + contradiction detection + dedup + clustering
   format.rs    - human-readable output formatting for MCP results
@@ -80,6 +81,8 @@ engram-cli dedup -t 0.90           # find duplicates (dry run)
 engram-cli dedup -t 0.90 --confirm # merge duplicates
 engram-cli wipe                    # show what would be wiped
 engram-cli wipe --confirm          # delete all project memories
+engram-cli reembed                 # dry run: report memories not on the current backend's model_version
+engram-cli reembed --confirm       # re-embed those memories (and handoff sidecar sections) in place
 engram-cli pin <id>                # pin a memory (exempt from decay/prune)
 engram-cli unpin <id>              # unpin a memory
 engram-cli insights                # show memory health insights
@@ -111,6 +114,15 @@ Section-based session capture (`summary, decisions, todos, blockers, mental_mode
 
 Section semantics: **todos** — Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items. **blockers** — Things preventing forward motion right now (missing access, failing dependency, unanswered question). **next_steps** — Post-session follow-ups beyond the current thread. Future-facing, not for immediate pickup.
 
+## Embedding backends
+Default (unset `ENGRAM_EMBED_BACKEND`): in-process `fastembed`/`ort`, unchanged, `model_version = "mdbr-leaf-ir-q8-d256"`. Alternative: `ENGRAM_EMBED_BACKEND=onnxruntime-server` talks HTTP to a separately-run [`onnxruntime-server`](https://github.com/kibae/onnxruntime-server) instance (`ENGRAM_EMBED_URL`, default `http://127.0.0.1:8080`; `ENGRAM_EMBED_MODEL`/`ENGRAM_EMBED_MODEL_VERSION`, defaults `mdbr-leaf-ir`/`1`). All tokenization/pooling/normalization stay client-side (`src/embed_remote.rs`), ported from `fastembed`'s own pipeline; only the ONNX forward pass moves to the external server. `model_version = "mdbr-leaf-ir-q8-d256-ortserver"` (deliberately distinct from the in-process one — a different ONNX Runtime build can produce slightly different numbers for the same quantized model, so the two are not bit-identical and not safe to mix in one project's similarity search).
+
+Engram never spawns/supervises `onnxruntime-server`; that's the operator's job. Fails fast (a few quick retries for transient connection errors only) if the server is unreachable or returns something unexpected — no silent fallback to in-process loading.
+
+`onnxruntime-server` layout gotcha: it reads the `.onnx` file into memory rather than by path, so it resolves the model's external-data file relative to its own CWD, not the model directory — start it from inside `${model_dir}/${model_name}/${model_version}/`.
+
+`check_model_version_guard` (in `embedding.rs`) refuses to run (MCP server startup, or any CLI command needing the embedding service except `reembed` itself) against a project whose stored embeddings carry a `model_version` different from the current backend's — hard error pointing at `engram-cli reembed --confirm`, not a soft warning. `reembed` re-embeds every memory's content through whichever backend is currently configured (general-purpose migration, not hardcoded to one transition) and also recomputes handoff sidecar per-section embeddings for any handoff memories it touches, since those aren't tracked by their own `model_version` and would otherwise silently stay on the old vector space.
+
 ## Config (env vars)
 - `ENGRAM_DB` - SQLite path (default: ~/.local/share/engram/memories.db)
 - `ENGRAM_PROJECT` - project scope (default: cwd name)
@@ -122,6 +134,10 @@ Section semantics: **todos** — Within-session work the next agent should pick 
 - `ENGRAM_HOOK_MIN_IMPORTANCE` - importance floor for hook captures (default: 0.5; values above 0.5 have no effect because dispatch caps importance at 0.5)
 - `ENGRAM_HOOK_USERPROMPTSUBMIT_ENABLED` - opt-in flag for the `UserPromptSubmit` hook (default off; even when on, captures require an explicit `#remember` cue)
 - `ENGRAM_MCP_TOOL_PROFILE` - advertised MCP tool surface: `full` (18 tools, default), `core` (11), or `minimal` (3: memory_context, memory_store, handoff_resume). Dispatch stays permissive — non-advertised tools still execute with a one-time `[engram]` warning per process.
+- `ENGRAM_EMBED_BACKEND` - `onnxruntime-server` to embed via an external HTTP server instead of in-process (default: unset, in-process)
+- `ENGRAM_EMBED_URL` - base URL of the `onnxruntime-server` instance (default: `http://127.0.0.1:8080`)
+- `ENGRAM_EMBED_MODEL` - model name as registered with `onnxruntime-server` (default: `mdbr-leaf-ir`)
+- `ENGRAM_EMBED_MODEL_VERSION` - model version as registered with `onnxruntime-server` (default: `1`)
 
 ## Commands
 ```bash

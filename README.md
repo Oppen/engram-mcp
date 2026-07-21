@@ -256,6 +256,76 @@ Handoffs are the lead workflow, but Engram is a full memory system underneath:
 
 Branch modes: `current` (global + current branch), `global` (global only), `all`, or a specific branch name.
 
+## Embedding backends
+
+By default Engram loads [mdbr-leaf-ir](https://huggingface.co/onnx-community/mdbr-leaf-ir-ONNX) in-process via `fastembed`/`ort` — no setup required, this is unchanged and remains the default.
+
+Alternatively, Engram can talk to a separately-run [`onnxruntime-server`](https://github.com/kibae/onnxruntime-server) instance over HTTP instead of loading the model in-process. All tokenization, pooling, and normalization still happen client-side in Engram exactly as before; only the ONNX forward pass moves to the external server. This is useful for sharing one loaded model across multiple Engram processes, or for running the model on different hardware/EP settings than the default.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ENGRAM_EMBED_BACKEND` | `onnxruntime-server` to use the HTTP backend; unset/anything else keeps the default in-process backend | unset (in-process) |
+| `ENGRAM_EMBED_URL` | Base URL of a running `onnxruntime-server` instance | `http://127.0.0.1:8080` |
+| `ENGRAM_EMBED_MODEL` | Model name as registered with `onnxruntime-server` | `mdbr-leaf-ir` |
+| `ENGRAM_EMBED_MODEL_VERSION` | Model version as registered with `onnxruntime-server` | `1` |
+
+Engram does not spawn, supervise, or manage the `onnxruntime-server` process in any way — keeping it running (via `launchd`, `systemd`, or manually) is entirely the operator's responsibility. If the server is unreachable or returns an unexpected response, Engram fails immediately with a clear error (a few quick retries cover a mid-restart server, not persistent unavailability) — there is no silent fallback to in-process loading.
+
+### Running `onnxruntime-server` for this model
+
+```bash
+brew install cmake boost openssl onnxruntime   # macOS; see the onnxruntime-server README for Linux
+git clone https://github.com/kibae/onnxruntime-server.git
+cd onnxruntime-server
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+```
+
+`onnxruntime-server` expects `${model_dir}/${model_name}/${model_version}/model.onnx`, with any external-data file for that model alongside it under its original name:
+
+```bash
+mkdir -p /path/to/models/mdbr-leaf-ir/1
+cp model_quantized.onnx      /path/to/models/mdbr-leaf-ir/1/model.onnx
+cp model_quantized.onnx_data /path/to/models/mdbr-leaf-ir/1/model_quantized.onnx_data
+```
+
+(`model_quantized.onnx` and `model_quantized.onnx_data` come from the [`onnx-community/mdbr-leaf-ir-ONNX`](https://huggingface.co/onnx-community/mdbr-leaf-ir-ONNX) repo's `onnx/` directory — the same files Engram's in-process backend downloads automatically.)
+
+**Gotcha (cost real debugging time to find): start the server from inside that model-version directory.** `onnxruntime-server` always reads the `.onnx` file into memory rather than opening it by path, so ONNX Runtime resolves the external-data reference relative to the server process's current working directory, not the model directory. Starting it from elsewhere fails with `External data path does not exist`:
+
+```bash
+cd /path/to/models/mdbr-leaf-ir/1
+/path/to/onnxruntime-server/build/src/standalone/onnxruntime_server \
+  --model-dir=/path/to/models --http-port=8080
+```
+
+Then point Engram at it:
+
+```bash
+export ENGRAM_EMBED_BACKEND=onnxruntime-server
+export ENGRAM_EMBED_URL=http://127.0.0.1:8080
+```
+
+### Switching backends on an existing project: `reembed`
+
+Different embedding backends — or even different builds of the same ONNX Runtime running the same quantized model — are not guaranteed to produce numerically comparable vectors. Engram stamps every stored embedding with a `model_version` string (`mdbr-leaf-ir-q8-d256` in-process, `mdbr-leaf-ir-q8-d256-ortserver` for the HTTP backend) and refuses to run a similarity search over a project that mixes them:
+
+```
+Error: project 'myproject' has stored embeddings under model_version(s) ["mdbr-leaf-ir-q8-d256"],
+but the configured embedding backend produces 'mdbr-leaf-ir-q8-d256-ortserver'. Mixing vector
+spaces in the same similarity search would silently corrupt results, so refusing to proceed. Run
+`engram-cli reembed --confirm` to migrate this project's embeddings to 'mdbr-leaf-ir-q8-d256-ortserver' first.
+```
+
+Resolve it by re-embedding the project under whichever backend is currently configured:
+
+```bash
+engram-cli reembed             # dry run: reports counts per current model_version
+engram-cli reembed --confirm   # re-embeds and overwrites in place
+```
+
+This re-embeds every memory's content (including handoff memories' per-section sidecar embeddings, so a handoff's main content and its sections never end up split across model versions) and is safe to re-run — memories already on the target `model_version` are skipped.
+
 ## CLI
 
 ```bash
@@ -301,6 +371,8 @@ engram-cli prune -t 0.2 --confirm
 engram-cli dedup -t 0.90
 engram-cli dedup -t 0.90 --confirm
 engram-cli wipe --confirm
+engram-cli reembed             # migrate embeddings to the currently configured backend (dry run)
+engram-cli reembed --confirm
 
 # Observability
 engram-cli insights
@@ -320,6 +392,10 @@ engram-cli health
 | `ENGRAM_MCP_TOOL_PROFILE` | Advertised MCP tool surface: `full` (23 tools), `core` (14), or `minimal` (3: `memory_context`, `memory_store`, `handoff_resume`). Dispatch stays permissive — non-advertised tools still execute with a one-time `[engram]` warning per process | `full` |
 | `ENGRAM_HOOK_DEDUP_SKIP` | Similarity threshold above which hook captures are silently dropped (clamped to `[0.5, 1.0]`) | `0.95` |
 | `ENGRAM_HOOK_DAILY_CAP` | Max hook-captured memories per project per UTC day; `0` = unlimited | `50` |
+| `ENGRAM_EMBED_BACKEND` | `onnxruntime-server` to embed via an external HTTP server instead of in-process; see [Embedding backends](#embedding-backends) | unset (in-process) |
+| `ENGRAM_EMBED_URL` | Base URL of the `onnxruntime-server` instance (only used when `ENGRAM_EMBED_BACKEND=onnxruntime-server`) | `http://127.0.0.1:8080` |
+| `ENGRAM_EMBED_MODEL` | Model name as registered with `onnxruntime-server` | `mdbr-leaf-ir` |
+| `ENGRAM_EMBED_MODEL_VERSION` | Model version as registered with `onnxruntime-server` | `1` |
 
 ## Retrieval benchmark
 
